@@ -84,7 +84,7 @@ distill_loss = λ_mse × MSE(P5_adapted, S5)          # Feature MSE (FitNets, Ro
 λ_mse            1.0     Feature MSE 가중치
 λ_at             0.5     Attention Transfer 가중치
 
-7. 구현 구조
+8. 구현 구조
 
 Cross_Arch_Distillation/
 ├── RT-DETR/                          # lyuwenyu/RT-DETR 공식 코드 (수정 없음)
@@ -96,7 +96,7 @@ Cross_Arch_Distillation/
 ├── yolov8n.pt                        # Student 초기 가중치
 └── rtdetr_r101vd_6x_coco_from_paddle.pth  # Teacher 사전학습 가중치
 
-8. 학습 실행
+9. 학습 실행
 
 python train.py \
     --teacher-cfg  RT-DETR/rtdetr_pytorch/configs/rtdetr/rtdetr_r101vd_6x_coco.yml \
@@ -112,7 +112,7 @@ python train.py \
     --lambda-at      0.5 \
     --save-dir     runs/distill 
 
-9. 참고 논문
+10. 참고 논문
     
 @article{zhao2023rtdetr,
   title={DETRs Beat YOLOs on Real-time Object Detection},
