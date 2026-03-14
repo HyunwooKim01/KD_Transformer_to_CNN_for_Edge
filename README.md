@@ -36,7 +36,7 @@ High-capacity Detection Model --(KD)--> Light-weight Detection Model --> Edge De
 
 ### Teacher Model : RT-DETR-R101
 
-선정 이유 : Transformer 기반 객체 탐지 모델로, Self-Attention을 통해 이미지의 전역 문맥(Global Context)을 파악하는 능력이 뛰어나다. 특히 AIFI(Attention-based Intra-scale Feature Interaction) 모듈을 통해 생성된 S5 Feature Map은 풍부한 의미론적 정보를 담고 있어 Student Model에 효과적인 지식을 제공할 수 있다고 판단하였다.
+선정 이유 : Transformer 기반 객체 탐지 모델로, Decoder의 Cross-Attention을 통해 이미지의 전역 문맥(Global Context)을 파악하는 능력이 뛰어나다. 특히 Decoder 마지막 레이어의 Cross-Attention weight는 300개의 쿼리가 이미지 내 어느 위치를 참조했는가를 나타내며, 이를 공간적 heatmap으로 변환하면 "전역 문맥으로 판단한 물체가 있을 위치"를 효과적으로 표현할 수 있다.
 
 ### Student Model : YOLOv8-n
 
@@ -51,29 +51,29 @@ COCO Dataset
      │
      ├──→ RT-DETR-R101 (Teacher, 고정)
      │         │
-     │       AIFI
+     │    Decoder Cross-Attention
+     │    (layers[-1].cross_attn)
      │         │
-     │      S5 Feature Map (384ch)
+     │    reference_points (B, 300, 1, 4)  ← 각 쿼리의 기준 좌표 (cx, cy)
+     │    attention_weights (B, 300, heads, levels*points)  ← 각 쿼리의 반응 강도
+     │         │
+     │    20×20 격자에 투영 (scatter_add)
+     │         │
+     │    RT-DETR Heatmap (B, 400)
+     │    "전역 문맥으로 물체가 있을 공간적 위치"
      │         │
      │         ▼
      └──→ YOLOv8-n (Student, 학습)
                │
-             SPPF
+           model[21] C2f
+           (Neck 끝, Detect 직전)
                │
-            P5 Feature Map (256ch)
+           채널 방향 제곱합 + 최대값 정규화
                │
-           FeatureAdapter (1×1 Conv)
+           YOLO Heatmap (B, 400)
+           "CNN이 탐지 직전 반응한 공간적 위치"
                │
-          P5_adapted (384ch)
-               │
-    ┌──────────┴──────────┐
-    │                     │
-MSE Loss              AT Loss
-(Feature 정렬)     (Attention 정렬)
-    │                     │
-    └──────────┬──────────┘
-               │
-         distill_loss
+         Attention Loss (MSE)
                │
           + det_loss (box + cls + dfl)
                │
@@ -88,30 +88,41 @@ MSE Loss              AT Loss
 
 ## 6. 지식 증류 방법
 
-### Feature-level Distillation
+### Attention Map Distillation
 
-RT-DETR의 AIFI를 통과한 S5 Feature Map을 YOLOv8-n의 P5에 증류한다.
+RT-DETR Decoder의 Cross-Attention weight를 공간적 heatmap으로 변환하여 YOLOv8-n의 Neck 출력과 정렬한다.
 
-- Teacher : `encoder.encoder[0]` (AIFI) 출력 S5 → shape : `(B, 384, H, W)`
-- Student : `model[9]` (SPPF) 출력 P5 → shape : `(B, 256, H, W)`
-- FeatureAdapter : 1×1 Conv로 Student P5의 채널을 Teacher S5에 맞게 변환 (256 → 384)
+**RT-DETR heatmap 생성**
+- Hook 위치 : `model.decoder.decoder.layers[-1].cross_attn`
+- `reference_points` (B, 300, 1, 4) 에서 cx, cy 추출
+- `attention_weights` Linear로 각 쿼리의 반응 강도 계산
+- cx, cy를 20×20 격자에 투영 후 반응 강도 누적 → (B, 400)
+- 최대값 정규화 → 0~1 범위
+
+**YOLO heatmap 생성**
+- Hook 위치 : `student.model[21]` (C2f, Neck 끝 Detect 직전)
+- Feature Map (B, 256, 20, 20) → 채널 방향 제곱합 → (B, 400)
+- 최대값 정규화 → 0~1 범위
+
+---
 
 ## 7. 손실함수 구성
 
 ```
-total_loss   = det_loss + λ_distill × distill_loss
+total_loss = det_loss + λ × attention_loss
 
-det_loss     = box_loss + cls_loss + dfl_loss        # YOLOv8 기존 손실함수
+det_loss      = box_loss + cls_loss + dfl_loss   # YOLOv8 기존 손실함수
 
-distill_loss = λ_mse × MSE(P5_adapted, S5)          # Feature MSE (FitNets, Romero 2015)
-             + λ_at  × AT(P5_adapted, S5)            # Attention Transfer (Zagoruyko 2017)
+attention_loss = MSE(YOLO_heatmap, RTDETR_heatmap)
+                 "RT-DETR이 전역 문맥으로 물체를 찾은 위치를
+                  YOLO가 탐지 직전에 같은 위치에 집중하도록 학습"
 ```
 
-| 하이퍼파라미터 | 기본값 | 설명 |
+| 하이퍼파라미터 | 값 | 설명 |
 |---|---|---|
-| λ_distill | 0.5 | 전체 증류 손실 가중치 |
-| λ_mse | 1.0 | Feature MSE 가중치 |
-| λ_at | 0.5 | Attention Transfer 가중치 |
+| λ | 50.0 | attention_loss 가중치 |
+
+λ=50은 AT Loss의 스케일이 det_loss 대비 매우 작기 때문에 균형을 맞추기 위해 설정하였다. 이는 AT 논문(Zagoruyko 2017)에서 β=1000을 사용한 것과 동일한 이유이며, attention_loss가 total_loss의 약 3~5%를 기여하도록 조정하였다.
 
 ---
 
@@ -121,9 +132,7 @@ distill_loss = λ_mse × MSE(P5_adapted, S5)          # Feature MSE (FitNets, Ro
 Cross_Arch_Distillation/
 ├── RT-DETR/                          # lyuwenyu/RT-DETR 공식 코드 (수정 없음)
 ├── ultralytics/                      # Ultralytics YOLOv8 공식 코드 (수정 없음)
-├── feature_distillation.py           # FeatureAdapter + MSE/AT Loss
-├── loss_patch.py                     # v8DetectionLoss monkey-patch
-├── train.py                          # 통합 학습 루프
+├── train_v2.py                       # 통합 학습 루프 (단일 파일)
 ├── data.yml                          # COCO 데이터셋 설정
 ├── yolov8n.pt                        # Student 초기 가중치
 └── rtdetr_r101vd_6x_coco_from_paddle.pth  # Teacher 사전학습 가중치
@@ -134,19 +143,17 @@ Cross_Arch_Distillation/
 ## 9. 학습 실행
 
 ```bash
-python train.py \
+python train_v2.py \
     --teacher-cfg  RT-DETR/rtdetr_pytorch/configs/rtdetr/rtdetr_r101vd_6x_coco.yml \
     --teacher-ckpt rtdetr_r101vd_6x_coco_from_paddle.pth \
     --student-ckpt yolov8n.pt \
-    --data         data.yml \
+    --data         /home/user/git/Cross_Arch_Distillation/data.yml \
     --nc           80 \
     --epochs       100 \
     --batch        16 \
     --device       cuda:0 \
-    --lambda-distill 0.5 \
-    --lambda-mse     1.0 \
-    --lambda-at      0.5 \
-    --save-dir     runs/distill
+    --lambda-attn  50.0 \
+    --save-dir     runs/distill_final
 ```
 
 ---
@@ -175,6 +182,12 @@ python train.py \
   author={Zagoruyko and Komodakis},
   booktitle={ICLR},
   year={2017}
+}
+@inproceedings{carion2020detr,
+  title={End-to-End Object Detection with Transformers},
+  author={Carion et al.},
+  booktitle={ECCV},
+  year={2020}
 }
 ```
 
