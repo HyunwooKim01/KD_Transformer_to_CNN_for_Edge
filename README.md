@@ -223,4 +223,12 @@ runs/distill_vN/
   booktitle={ECCV},
   year={2014}
 }
+@inproceedings{cao2022pkd,
+  title={PKD: General Distillation Framework for Object Detectors
+         via Pearson Kernel},
+  author={Cao, Weihan and Zhang, Hangjie and Wang, Nian
+          and Gao, Xinzhe and Tao, Dacheng},
+  booktitle={NeurIPS},
+  year={2022}
+}
 ```
