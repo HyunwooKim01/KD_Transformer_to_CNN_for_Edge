@@ -61,7 +61,7 @@ model[21] C2f → P5 (B, 256, 20, 20) → 채널 제곱합 → heatmap (B,  400)
 
 ## 손실함수
 
-### v2 : 단일 스케일 Pearson
+### v2 : 단일 스케일 MSE
 
 ```
 total_loss = det_loss + λ × pearson_loss(P5_heatmap, rtdetr_large_heatmap)
