@@ -153,7 +153,7 @@ python train_v4.py \
 | 항목 | v2 | v3 | v4 |
 |---|---|---|---|
 | lambda-attn | 50.0 | 50.0 | 5.0 |
-| loss | Pearson | MSE | Pearson |
+| loss | MSE | MSE | Pearson |
 | 스케일 | 단일 (P5) | 멀티 (P3/P4/P5) | 멀티 (P3/P4/P5) |
 | batch | 24 | 24 | 24 |
 | epochs | 100 | 100 | 100 |
