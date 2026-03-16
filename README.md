@@ -98,7 +98,7 @@ feature가 죽는 현상(under-activation) 발생 가능.
 
 ## 실행 방법
 
-### v2 (단일 스케일 / Pearson)
+### v2 (단일 스케일 / MSE)
 
 ```bash
 python train_v2.py \
