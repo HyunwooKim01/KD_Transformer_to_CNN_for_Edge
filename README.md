@@ -25,7 +25,7 @@
 ├── yolov8n.pt                        ← YOLOv8-n 사전학습 가중치
 ├── rtdetr_r101vd_6x_coco_from_paddle.pth  ← RT-DETR 사전학습 가중치
 │
-├── train_v2.py                       ★ 단일 스케일 / Pearson
+├── train_v2.py                       ★ 단일 스케일
 ├── train_v3.py                       ★ 멀티 스케일 / MSE
 ├── train_v4.py                       ★ 멀티 스케일 / Pearson
 └── data.yml                          ← COCO 데이터셋 설정
