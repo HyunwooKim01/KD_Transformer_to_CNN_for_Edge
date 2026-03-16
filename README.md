@@ -4,7 +4,7 @@
 
 | 버전 | 파일 | 증류 방식 | 손실함수 | Hook 위치 |
 |---|---|---|---|---|
-| v2 | `train_v2.py` | 단일 스케일 (P5 20×20) | Pearson | model[21] |
+| v2 | `train_v2.py` | 단일 스케일 (P5 20×20) | MSE | model[21] |
 | v3 | `train_v3.py` | 멀티 스케일 (P3/P4/P5) | MSE | model[15/18/21] |
 | v4 | `train_v4.py` | 멀티 스케일 (P3/P4/P5) | Pearson | model[15/18/21] |
 
