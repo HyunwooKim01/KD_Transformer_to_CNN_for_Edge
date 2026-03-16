@@ -4,13 +4,19 @@ train.py - RT-DETR → YOLOv8-n Knowledge Distillation
 손실함수 구성:
     total_loss = det_loss + λ × attention_loss
 
-    attention_loss = MSE(
-        YOLO_heatmap,       ← model[21] C2f 출력 (Neck 끝, Detect 직전)
-        RTDETR_heatmap      ← Decoder Cross-Attention weight 합산
-    )
+    attention_loss = Pearson(P3_heatmap, rtdetr_small_heatmap)  ← 소형 객체
+                   + Pearson(P4_heatmap, rtdetr_mid_heatmap)    ← 중형 객체
+                   + Pearson(P5_heatmap, rtdetr_large_heatmap)  ← 대형 객체
 
-    RTDETR_heatmap : "전역 문맥으로 물체가 있을 위치"
-    YOLO_heatmap   : "CNN이 탐지 직전 반응한 위치"
+    Pearson Correlation Loss 사용 이유 :
+        값의 절대적 크기 무관, 패턴(상대적 반응 순위)만 비교
+        RT-DETR(sparse) vs YOLO(dense) 스케일 차이 완전 해결
+        loss = 1 - cosine_similarity(x - mean(x), y - mean(y))
+
+    쿼리 크기 분류 (reference_points w*h 기준):
+        소형 : w*h < 0.01  → 80×80 격자 → YOLO P3 (model[15])
+        중형 : w*h < 0.10  → 40×40 격자 → YOLO P4 (model[18])
+        대형 : w*h >= 0.10 → 20×20 격자 → YOLO P5 (model[21])
 
 출처:
     [RT-DETR]    lyuwenyu/RT-DETR
@@ -61,20 +67,29 @@ class FeatureHook:
         self._handle.remove()
 
 
+# ★ 변경 1 : CrossAttnWeightHook
+# 단일 20×20 heatmap → 쿼리 크기별 3개 heatmap (P3/P4/P5)
 class CrossAttnWeightHook:
     """
-    RT-DETR Decoder Cross-Attention → 공간적 heatmap 생성
+    RT-DETR Decoder Cross-Attention → 객체 크기별 공간 heatmap 생성
     위치 : model.decoder.decoder.layers[-1].cross_attn
 
-    reference_points : (B, 300, 1, 4) - 각 쿼리의 기준 좌표 (cx, cy, w, h) 0~1
-    attn_weights     : (B, 300, n_heads, n_levels*n_points) - 쿼리별 반응 강도
+    reference_points : (B, 300, 1, 4) - cx, cy, w, h  (0~1 정규화)
+    attn_weights     : 쿼리별 반응 강도
 
-    → cx, cy를 20×20 격자에 투영 후 반응 강도 누적
-    → 결과 : (B, 400) "RT-DETR이 전역 문맥으로 물체가 있다고 판단한 공간적 위치"
+    쿼리를 w*h 기준으로 3그룹으로 분류:
+        소형 (w*h < 0.01)  → 80×80 격자 → heatmap_small  (B, 6400)
+        중형 (w*h < 0.10)  → 40×40 격자 → heatmap_mid    (B, 1600)
+        대형 (w*h >= 0.10) → 20×20 격자 → heatmap_large  (B,  400)
     """
-    def __init__(self, module: nn.Module, grid_size: int = 20):
-        self.weights = None
-        self.grid_size = grid_size
+    # 쿼리 크기 분류 임계값
+    SMALL_THR = 0.01   # w*h < 0.01 → 소형
+    MID_THR   = 0.10   # w*h < 0.10 → 중형, 이상 → 대형
+
+    def __init__(self, module: nn.Module):
+        self.heatmap_small = None   # (B, 6400) P3 대응
+        self.heatmap_mid   = None   # (B, 1600) P4 대응
+        self.heatmap_large = None   # (B,  400) P5 대응
         self._handle = module.register_forward_hook(self._hook)
 
     def _hook(self, module, input, output):
@@ -82,28 +97,39 @@ class CrossAttnWeightHook:
         reference_points = input[1]   # (B, 300, 1, 4) cx,cy,w,h  0~1
 
         B      = query.shape[0]
-        G      = self.grid_size
         device = query.device
 
-        # 각 쿼리의 기준 좌표 추출
-        cx = reference_points[:, :, 0, 0].detach()   # (B, 300)  0~1
-        cy = reference_points[:, :, 0, 1].detach()   # (B, 300)  0~1
+        cx = reference_points[:, :, 0, 0].detach()   # (B, 300)
+        cy = reference_points[:, :, 0, 1].detach()   # (B, 300)
+        qw = reference_points[:, :, 0, 2].detach()   # (B, 300) 쿼리 너비
+        qh = reference_points[:, :, 0, 3].detach()   # (B, 300) 쿼리 높이
+        area = qw * qh                                # (B, 300) 쿼리 면적
 
-        # 각 쿼리의 반응 강도 : softmax 후 합산
-        attn_w = module.attention_weights(query)      # (B, 300, n_heads*n_levels*n_points)
+        # 쿼리별 반응 강도
+        attn_w = module.attention_weights(query)
         attn_w = F.softmax(attn_w, dim=-1).sum(dim=-1).detach()  # (B, 300)
 
-        # cx, cy → 격자 인덱스
-        ix  = (cx * G).long().clamp(0, G - 1)        # (B, 300)
-        iy  = (cy * G).long().clamp(0, G - 1)        # (B, 300)
-        idx = iy * G + ix                             # (B, 300)  1D 인덱스
+        # 크기별 마스크
+        mask_small = area < self.SMALL_THR                          # 소형
+        mask_mid   = (area >= self.SMALL_THR) & (area < self.MID_THR)  # 중형
+        mask_large = area >= self.MID_THR                           # 대형
 
-        # 20×20 격자에 반응 강도 누적
+        self.heatmap_small = self._project(cx, cy, attn_w, mask_small, B, G=80, device=device)
+        self.heatmap_mid   = self._project(cx, cy, attn_w, mask_mid,   B, G=40, device=device)
+        self.heatmap_large = self._project(cx, cy, attn_w, mask_large, B, G=20, device=device)
+
+    @staticmethod
+    def _project(cx, cy, attn_w, mask, B, G, device):
+        """해당 마스크의 쿼리들을 G×G 격자에 반응 강도 누적"""
         heatmap = torch.zeros(B, G * G, device=device)
+        ix  = (cx * G).long().clamp(0, G - 1)
+        iy  = (cy * G).long().clamp(0, G - 1)
+        idx = iy * G + ix                              # (B, 300)
         for b in range(B):
-            heatmap[b].scatter_add_(0, idx[b], attn_w[b])
-
-        self.weights = heatmap  # (B, 400)
+            m = mask[b]                                # (300,) bool
+            if m.any():
+                heatmap[b].scatter_add_(0, idx[b][m], attn_w[b][m])
+        return heatmap
 
     def remove(self):
         self._handle.remove()
@@ -114,25 +140,33 @@ class CrossAttnWeightHook:
 # ══════════════════════════════════════════════════════════════════════════════
 def make_yolo_heatmap(feat: torch.Tensor) -> torch.Tensor:
     """
-    YOLO model[21] C2f 출력 → heatmap
-    feat : (B, C, H, W)
-    return : (B, H*W) 최대값 정규화 (0~1)
+    YOLO feature map → 평균 제거 heatmap (Pearson Loss용)
+    feat   : (B, C, H, W)
+    return : (B, H*W) 평균 제거
     """
     B = feat.shape[0]
-    heatmap = feat.pow(2).sum(dim=1)        # (B, H, W)
-    heatmap = heatmap.view(B, -1)           # (B, H*W)
-    # 최대값으로 정규화 → 0~1 범위, 값 크기 보존
-    heatmap = heatmap / (heatmap.max(dim=1, keepdim=True).values + 1e-8)
-    return heatmap
+    heatmap = feat.pow(2).sum(dim=1).view(B, -1)
+    return heatmap - heatmap.mean(dim=1, keepdim=True)
 
 
 def make_rtdetr_heatmap(heatmap: torch.Tensor) -> torch.Tensor:
     """
-    CrossAttnWeightHook.weights → 최대값 정규화 (0~1)
-    heatmap : (B, 400) 이미 공간적으로 투영된 값
-    return  : (B, 400) 최대값 정규화
+    CrossAttnWeightHook 출력 → 평균 제거 heatmap (Pearson Loss용)
+    heatmap : (B, G*G)
+    return  : (B, G*G) 평균 제거
     """
-    return heatmap / (heatmap.max(dim=1, keepdim=True).values + 1e-8)
+    return heatmap - heatmap.mean(dim=1, keepdim=True)
+
+
+def pearson_loss(yolo: torch.Tensor, rtdetr: torch.Tensor) -> torch.Tensor:
+    """
+    Pearson Correlation Loss
+    yolo, rtdetr : (B, N) 평균 제거된 heatmap
+    return       : scalar  1 - cosine_similarity
+                   0 = 완전히 같은 패턴
+                   2 = 완전히 반대 패턴
+    """
+    return (1.0 - F.cosine_similarity(yolo, rtdetr, dim=1)).mean()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -144,8 +178,6 @@ def validate(student: nn.Module, save_dir: Path, args) -> dict:
     별도 YOLO 인스턴스로 검증 → deepcopy 없이 student 상태 완전 보호
     """
     tmp_path = save_dir / '_val_tmp.pt'
-
-    # deepcopy 대신 state_dict만 저장 (Hook 텐서 문제 회피)
     tmp_model = DetectionModel('yolov8n.yaml', nc=80)
     tmp_model.load_state_dict(student.state_dict())
     torch.save({'model': tmp_model.half()}, tmp_path)
@@ -175,7 +207,6 @@ def validate(student: nn.Module, save_dir: Path, args) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 def save_checkpoint(save_dir, student, optimizer, epoch, metrics, is_best):
     save_dir.mkdir(parents=True, exist_ok=True)
-    # deepcopy 대신 state_dict만 저장 (Hook 텐서 deepcopy 불가 문제 회피)
     ckpt = {
         'epoch'    : epoch,
         'metrics'  : metrics,
@@ -208,7 +239,6 @@ def train(args):
     teacher = cfg.model.deploy()
 
     ckpt = torch.load(args.teacher_ckpt, map_location='cpu')
-    # ckpt['ema']['module'] 구조 우선 탐색  ★
     if isinstance(ckpt, dict):
         if 'ema' in ckpt and isinstance(ckpt['ema'], dict) and 'module' in ckpt['ema']:
             state = ckpt['ema']['module']
@@ -225,8 +255,6 @@ def train(args):
 
     # ──────────────────────────────────────────────────────────────────────────
     # [2] RT-DETR Cross-Attention Hook 등록
-    # 위치 : model.decoder.decoder.layers[-1].cross_attn
-    # 마지막 Decoder layer의 Cross-Attention weight 캡처
     # ──────────────────────────────────────────────────────────────────────────
     print('[2] RT-DETR Cross-Attention Hook 등록')
     cross_attn_hook = CrossAttnWeightHook(
@@ -243,10 +271,14 @@ def train(args):
     student.load_state_dict(ckpt['model'].float().state_dict(), strict=False)
     student = student.to(device).train()
 
-    # YOLO Hook : model[21] = C2f (Neck 끝, Detect 직전)
-    yolo_hook = FeatureHook(student.model[21])
+    # ★ 변경 2 : YOLO Hook 3개 등록
+    # model[15] = C2f  P3 80×80 (소형 객체)
+    # model[18] = C2f  P4 40×40 (중형 객체)
+    # model[21] = C2f  P5 20×20 (대형 객체)
+    hook_p3 = FeatureHook(student.model[15])
+    hook_p4 = FeatureHook(student.model[18])
+    hook_p5 = FeatureHook(student.model[21])
 
-    # v8DetectionLoss
     if not hasattr(student, 'args'):
         student.args = SimpleNamespace(
             box=7.5, cls=0.5, dfl=1.5,
@@ -290,34 +322,40 @@ def train(args):
         t0 = time.time()
 
         for batch_idx, batch in enumerate(train_loader):
-            # batch 전체를 device로 이동
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
             images = batch['img'].float() / 255.0
-            B, C, H, W = images.shape
 
-            # ── RT-DETR forward → Cross-Attention weight 캡처 ────────────────
+            # ── RT-DETR forward → 크기별 Cross-Attention heatmap 캡처 ─────────
             with torch.no_grad():
                 teacher(images)
-            # cross_attn_hook.weights : (B, 300)
-            rtdetr_heatmap = make_rtdetr_heatmap(
-                cross_attn_hook.weights,                             # (B, 400) 공간 투영됨
-            )                                                        # (B, 400) 최대값 정규화
 
-            # ── YOLOv8 forward → Neck 끝 feature 캡처 ────────────────────────
+            # ★ 변경 3 : 크기별 RT-DETR heatmap 생성
+            rtdetr_small = make_rtdetr_heatmap(cross_attn_hook.heatmap_small)  # (B, 6400)
+            rtdetr_mid   = make_rtdetr_heatmap(cross_attn_hook.heatmap_mid)    # (B, 1600)
+            rtdetr_large = make_rtdetr_heatmap(cross_attn_hook.heatmap_large)  # (B,  400)
+
+            # ── YOLOv8 forward → 각 스케일 feature 캡처 ──────────────────────
             preds = student(images)
-            # yolo_hook.feat : (B, 256, 20, 20)
-            yolo_heatmap = make_yolo_heatmap(yolo_hook.feat)        # (B, 400) 최대값 정규화
+
+            # ★ 변경 4 : 크기별 YOLO heatmap 생성
+            yolo_small = make_yolo_heatmap(hook_p3.feat)   # (B, 6400) P3 80×80
+            yolo_mid   = make_yolo_heatmap(hook_p4.feat)   # (B, 1600) P4 40×40
+            yolo_large = make_yolo_heatmap(hook_p5.feat)   # (B,  400) P5 20×20
 
             # ── Detection Loss ────────────────────────────────────────────────
             det_total, _ = det_loss_fn(preds, batch)
             if det_total.dim() > 0:
                 det_total = det_total.sum()
 
-            # ── Attention Loss ────────────────────────────────────────────────
-            # RT-DETR가 전역 문맥으로 물체를 찾은 위치를
-            # YOLO가 탐지 직전에 같은 위치에 집중하도록 학습  [AT2017][DETR]
-            attn_loss = F.mse_loss(yolo_heatmap, rtdetr_heatmap.detach())
+            # ★ 변경 5 : 크기별 Pearson Correlation Loss 합산
+            # 스케일 무관, 패턴(상대적 위치 반응)만 비교
+            # 소형 쿼리 → P3, 중형 쿼리 → P4, 대형 쿼리 → P5
+            attn_loss = (
+                pearson_loss(yolo_small, rtdetr_small.detach()) +
+                pearson_loss(yolo_mid,   rtdetr_mid.detach())   +
+                pearson_loss(yolo_large, rtdetr_large.detach())
+            )
 
             # ── Total Loss ────────────────────────────────────────────────────
             total_loss = det_total + args.lambda_attn * attn_loss
@@ -347,8 +385,6 @@ def train(args):
         epoch_det   /= n
         epoch_attn  /= n
 
-        # ── 검증 ─────────────────────────────────────────────────────────────
-        # 임시 파일 저장 후 별도 YOLO 인스턴스로 검증 → student 상태 완전 보호
         val_metrics = validate(student, save_dir, args)
         elapsed = time.time() - t0
         print(
@@ -379,7 +415,9 @@ def train(args):
         )
 
     cross_attn_hook.remove()
-    yolo_hook.remove()
+    hook_p3.remove()
+    hook_p4.remove()
+    hook_p5.remove()
     log_file.close()
     print(f'\n학습 완료.  best mAP50={best_map:.4f}  저장={save_dir}')
 
@@ -401,7 +439,7 @@ def parse_args():
     p.add_argument('--workers',       type=int,   default=8)
     p.add_argument('--device',        default='cuda:0')
     p.add_argument('--lambda-attn',   type=float, default=0.5)
-    p.add_argument('--save-dir',      default='runs/distill_v2')
+    p.add_argument('--save-dir',      default='runs/distill_v3')
     return p.parse_args()
 
 
